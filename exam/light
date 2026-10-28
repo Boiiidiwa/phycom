@@ -1,0 +1,223 @@
+
+#include <WiFiS3.h>
+#include <MQTTClient.h>
+#include <math.h>
+
+// ===== ส่วนที่ 1: Thermistor =====
+const int THERMISTOR_PIN = A0;
+const float T0 = 298.15;
+const float R0 = 10000.0;
+const float B_VALUE = 4050.0;
+const float R_FIXED = 10000.0;
+const float ADC_MAX = 1200.0;
+
+// ===== ส่วนที่ 2: Wi-Fi และ MQTT =====
+const char WIFI_SSID[] = "boiii";
+const char WIFI_PASSWORD[] = "b123456789";
+
+const char MQTT_BROKER_ADDRESS[] = "phycom.it.kmitl.ac.th";
+const int MQTT_PORT = 1883;
+
+const char MQTT_CLIENT_ID[] = "boonsita68070092";
+const char MQTT_USERNAME[] = "";
+const char MQTT_PASSWORD[] = "";
+
+const char PUBLISH_TOPIC[] = "68070092/temp";
+const char SUBSCRIBE_TOPIC[] = "tan/receive";
+const char TEMP_TOPIC[] = "tan/temperature";
+const char LED_TOPIC[] = "tan/led";
+
+WiFiClient network;
+MQTTClient mqtt(256);
+
+unsigned long lastPublishTime = 0;
+const unsigned long PUBLISH_INTERVAL = 1000;
+
+// ===== ส่วนที่ 3: อ่านอุณหภูมิ =====
+float readCelsius() {
+  long sum = 0;
+
+  for (int i = 0; i < 20; i++) {
+    sum += analogRead(THERMISTOR_PIN);
+    delay(5);
+  }
+
+  float adc = sum / 20.0;
+
+  // ป้องกันการหารด้วยศูนย์หรือค่า ADC ที่เกินช่วง
+  if (adc <= 0 || adc >= ADC_MAX) {
+    return NAN;
+  }
+
+  float r = R_FIXED * adc / (ADC_MAX - adc);
+
+  float kelvin = 1.0 / (
+    (1.0 / T0) + (log(r / R0) / B_VALUE)
+  );
+
+  return kelvin - 273.15;
+}
+
+// ===== ส่วนที่ 4: เชื่อมต่อ Wi-Fi =====
+bool connectToWiFi() {
+  Serial.print("Connecting to Wi-Fi: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long startTime = millis();
+
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - startTime < 15000) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Wi-Fi connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    return true;
+  }
+
+  Serial.println("Wi-Fi connection failed!");
+  return false;
+}
+
+// ===== ส่วนที่ 5: สมัครรับ Topic =====
+void subscribeTopic(const char *topic) {
+  if (mqtt.subscribe(topic)) {
+    Serial.print("Subscribed to: ");
+  } else {
+    Serial.print("Failed to subscribe: ");
+  }
+
+  Serial.println(topic);
+}
+
+// ===== ส่วนที่ 6: เชื่อมต่อ MQTT =====
+bool connectToMQTT() {
+  mqtt.begin(MQTT_BROKER_ADDRESS, MQTT_PORT, network);
+  mqtt.onMessage(messageReceived);
+
+  Serial.println("Connecting to MQTT Broker...");
+
+  for (int attempt = 0; attempt < 5; attempt++) {
+    if (mqtt.connect(
+          MQTT_CLIENT_ID,
+          MQTT_USERNAME,
+          MQTT_PASSWORD)) {
+
+      Serial.println("MQTT connected!");
+
+      subscribeTopic(SUBSCRIBE_TOPIC);
+      subscribeTopic(TEMP_TOPIC);
+      subscribeTopic(LED_TOPIC);
+
+      return true;
+    }
+
+    Serial.println("MQTT connection failed. Retrying...");
+    delay(2000);
+  }
+
+  Serial.println("Unable to connect to MQTT.");
+  return false;
+}
+
+// ===== ส่วนที่ 7: ส่งอุณหภูมิ =====
+void sendToMQTT(float val) {
+  if (!mqtt.connected()) {
+    Serial.println("MQTT disconnected. Skip publishing.");
+    return;
+  }
+
+  char messageBuffer[20];
+  snprintf(messageBuffer, sizeof(messageBuffer), "%.2f", val);
+
+  bool success = mqtt.publish(PUBLISH_TOPIC, messageBuffer);
+
+  Serial.print("Topic: ");
+  Serial.println(PUBLISH_TOPIC);
+
+  Serial.print("Payload: ");
+  Serial.println(messageBuffer);
+
+  if (success) {
+    Serial.println("Publish accepted by MQTT client.");
+  } else {
+    Serial.println("Publish failed!");
+  }
+
+  Serial.println("--------------------");
+}
+
+// ===== ส่วนที่ 8: รับข้อความ =====
+void messageReceived(String &topic, String &payload) {
+  Serial.println("Received from MQTT:");
+  Serial.print("Topic: ");
+  Serial.println(topic);
+
+  Serial.print("Payload: ");
+  Serial.println(payload);
+}
+
+// ===== ส่วนที่ 9: setup =====
+void setup() {
+  Serial.begin(9600);
+  delay(1000);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    if (connectToWiFi()) {
+      break;
+    }
+
+    Serial.println("Retrying Wi-Fi in 3 seconds...");
+    delay(3000);
+  }
+
+  while (!connectToMQTT()) {
+    delay(3000);
+  }
+}
+
+// ===== ส่วนที่ 10: loop =====
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Wi-Fi disconnected. Reconnecting...");
+
+    while (!connectToWiFi()) {
+      delay(3000);
+    }
+
+    // หลัง Wi-Fi กลับมา ให้เชื่อม MQTT ใหม่
+    connectToMQTT();
+  }
+
+  if (!mqtt.connected()) {
+    Serial.println("MQTT disconnected. Reconnecting...");
+
+    while (!connectToMQTT()) {
+      delay(3000);
+    }
+  }
+
+  mqtt.loop();
+
+  if (millis() - lastPublishTime >= PUBLISH_INTERVAL) {
+    lastPublishTime = millis();
+
+    float temp = readCelsius();
+
+    if (!isnan(temp)) {
+      Serial.print("Temperature: ");
+      Serial.println(temp, 2);
+
+      sendToMQTT(temp);
+    } else {
+      Serial.println("Invalid Thermistor reading. Check wiring.");
+    }
+  }
+}
